@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "openconnect-gp",
+  "name": "GlobalProtect",
+  "version": "1.0.0",
+  "author": "deey001",
+  "license": "MIT",
+  "description": "Split-tunnel GlobalProtect VPN for the Omarchy bar. Talks to OpenConnect. Never installs a default route.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "GlobalProtect",
+    "description": "Connect, disconnect, and read split-tunnel routes from the bar.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

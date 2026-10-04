@@ -1,0 +1,919 @@
+#!/usr/bin/env python3
+"""OpenConnect GlobalProtect client with a hard split tunnel.
+
+Password and cookie stay off argv. The default route is never installed.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import getpass
+import json
+import os
+import pwd
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+IFACE = "ocgp0"
+RUN_DIR = Path("/run/openconnect-gp")
+PID_FILE = RUN_DIR / "openconnect.pid"
+STATUS_FILE = RUN_DIR / "status.json"
+LOCK_FILE = RUN_DIR / "lock"
+REAL_VPNC = Path("/etc/vpnc/vpnc-script")
+HIP_SCRIPT = Path("/usr/lib/openconnect/hipreport.sh")
+LIB_DIR = Path("/usr/local/lib/openconnect-gp")
+HELPER = Path("/usr/local/bin/ocgp")
+OS_CHOICES = {"linux", "linux-64", "win", "mac-intel", "android", "apple-ios"}
+PORTAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
+USER_RE = re.compile(r"^[\w.@\\-]{1,128}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
+FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9:+/=_-]{8,256}$")
+DOMAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
+AUTH_LINE_RE = re.compile(r"^([A-Z][A-Z0-9_]*)='(.*)'$")
+
+
+def config_path() -> Path:
+    override = os.environ.get("OCGP_CONFIG")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "openconnect-gp" / "config.json"
+
+
+def default_config() -> dict:
+    return {
+        "portal": "",
+        "username": "",
+        "os": "linux",
+        "extra_routes": [],
+        "dns_domains": [],
+    }
+
+
+def load_config(path: Path | None = None) -> dict:
+    path = path or config_path()
+    data = default_config()
+    if path.is_file():
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise SystemExit("config is not a JSON object")
+        data.update(loaded)
+    data["extra_routes"] = list(data.get("extra_routes") or [])
+    data["dns_domains"] = list(data.get("dns_domains") or [])
+    return data
+
+
+def save_config(data: dict, path: Path | None = None) -> None:
+    path = path or config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def normalize_portal(value: str) -> str:
+    text = value.strip()
+    text = re.sub(r"^https?://", "", text, flags=re.IGNORECASE)
+    text = text.split("/")[0].strip()
+    if not PORTAL_RE.fullmatch(text):
+        raise ValueError(f"portal address refused: {value!r}")
+    return text
+
+
+def check_username(value: str) -> str:
+    text = value.strip()
+    if text and not USER_RE.fullmatch(text):
+        raise ValueError("username has characters this client will not send")
+    return text
+
+
+def check_os_name(value: str) -> str:
+    text = (value or "linux").strip()
+    if text not in OS_CHOICES:
+        raise ValueError(f"os must be one of: {', '.join(sorted(OS_CHOICES))}")
+    return text
+
+
+def ipv4_ok(addr: str) -> bool:
+    parts = addr.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        nums = [int(part) for part in parts]
+    except ValueError:
+        return False
+    return all(0 <= num <= 255 for num in nums)
+
+
+def mask_from_len(length: int) -> str:
+    bits = (0xFFFFFFFF << (32 - length)) & 0xFFFFFFFF
+    return ".".join(str((bits >> shift) & 255) for shift in (24, 16, 8, 0))
+
+
+def parse_cidr(cidr: str) -> tuple[str, str, str]:
+    text = cidr.strip()
+    addr, sep, length_text = text.partition("/")
+    if not sep or not ipv4_ok(addr):
+        raise ValueError(f"not an IPv4 CIDR: {cidr}")
+    try:
+        length = int(length_text)
+    except ValueError as exc:
+        raise ValueError(f"not an IPv4 CIDR: {cidr}") from exc
+    if not 1 <= length <= 32:
+        raise ValueError(f"prefix length refused: {cidr}")
+    if addr == "0.0.0.0":
+        raise ValueError("0.0.0.0 is a default route and is refused")
+    return addr, mask_from_len(length), str(length)
+
+
+def parse_route_list(value: str) -> list[str]:
+    routes: list[str] = []
+    for item in re.split(r"[\s,]+", value.strip()):
+        if not item:
+            continue
+        addr, _mask, length = parse_cidr(item)
+        routes.append(f"{addr}/{length}")
+    return routes
+
+
+def parse_domain_list(value: str) -> list[str]:
+    domains: list[str] = []
+    for item in re.split(r"[\s,]+", value.strip()):
+        if not item:
+            continue
+        name = item[1:] if item.startswith("~") else item
+        if not DOMAIN_RE.fullmatch(name):
+            raise ValueError(f"DNS domain refused: {item}")
+        domains.append(name)
+    return domains
+
+
+def scrub(text: str) -> str:
+    kept = []
+    for line in text.splitlines():
+        lowered = line.lower()
+        if "cookie" in lowered or "password" in lowered or "passwd" in lowered:
+            continue
+        kept.append(line)
+    message = "\n".join(kept[-8:]).strip()
+    return message[:500]
+
+
+def parse_auth_output(text: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for line in text.splitlines():
+        match = AUTH_LINE_RE.match(line.strip())
+        if match:
+            found[match.group(1)] = match.group(2)
+    return found
+
+
+def _drop_indexed(env: dict[str, str], prefix: str) -> None:
+    for key in list(env):
+        if key.startswith(prefix):
+            del env[key]
+
+
+def _v4_includes(env: dict[str, str]) -> list[tuple[str, str, str]]:
+    try:
+        count = int(env.get("CISCO_SPLIT_INC") or 0)
+    except ValueError:
+        count = 0
+    routes = []
+    for index in range(max(0, count)):
+        addr = env.get(f"CISCO_SPLIT_INC_{index}_ADDR", "")
+        mask = env.get(f"CISCO_SPLIT_INC_{index}_MASK", "")
+        length = env.get(f"CISCO_SPLIT_INC_{index}_MASKLEN", "")
+        if not ipv4_ok(addr) or addr == "0.0.0.0":
+            continue
+        if length in {"", "0"}:
+            continue
+        routes.append((addr, mask, length))
+    return routes
+
+
+def _v6_includes(env: dict[str, str]) -> list[tuple[str, str]]:
+    try:
+        count = int(env.get("CISCO_IPV6_SPLIT_INC") or 0)
+    except ValueError:
+        count = 0
+    routes = []
+    for index in range(max(0, count)):
+        addr = env.get(f"CISCO_IPV6_SPLIT_INC_{index}_ADDR", "")
+        length = env.get(f"CISCO_IPV6_SPLIT_INC_{index}_MASKLEN", "")
+        if not addr or length in {"", "0"}:
+            continue
+        routes.append((addr, length))
+    return routes
+
+
+def extra_routes_from_config(path: str | None) -> list[tuple[str, str, str]]:
+    if not path:
+        return []
+    file = Path(path)
+    if not file.is_file():
+        return []
+    try:
+        data = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    routes = []
+    for item in data.get("extra_routes") or []:
+        try:
+            routes.append(parse_cidr(str(item)))
+        except ValueError:
+            continue
+    return routes
+
+
+def dns_domains(env: dict[str, str], path: str | None) -> list[str]:
+    names: list[str] = []
+    for key in ("CISCO_DEF_DOMAIN", "CISCO_SPLIT_DNS"):
+        raw = env.get(key, "")
+        for item in raw.replace(",", " ").split():
+            name = item[1:] if item.startswith("~") else item
+            if DOMAIN_RE.fullmatch(name):
+                names.append(name)
+    if path and Path(path).is_file():
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        for item in data.get("dns_domains") or []:
+            name = str(item)
+            name = name[1:] if name.startswith("~") else name
+            if DOMAIN_RE.fullmatch(name):
+                names.append(name)
+    unique = []
+    seen = set()
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            unique.append("~" + name)
+    return unique
+
+
+def rewrite_split_env(env: dict[str, str], config: str | None = None) -> dict[str, str]:
+    """Return env that cannot install an IPv4 or IPv6 default route."""
+    updated = dict(env)
+    routes = _v4_includes(updated)
+    seen = {addr for addr, _mask, _length in routes}
+    for addr, mask, length in extra_routes_from_config(config):
+        if addr not in seen:
+            routes.append((addr, mask, length))
+            seen.add(addr)
+    _drop_indexed(updated, "CISCO_SPLIT_INC_")
+    # "0" is non-empty, so vpnc-script takes the split loop and skips
+    # set_ipv4_default_route. An empty value would install the default route.
+    updated["CISCO_SPLIT_INC"] = str(len(routes)) if routes else "0"
+    for index, (addr, mask, length) in enumerate(routes):
+        updated[f"CISCO_SPLIT_INC_{index}_ADDR"] = addr
+        updated[f"CISCO_SPLIT_INC_{index}_MASK"] = mask or mask_from_len(int(length))
+        updated[f"CISCO_SPLIT_INC_{index}_MASKLEN"] = length
+
+    v6 = _v6_includes(updated)
+    _drop_indexed(updated, "CISCO_IPV6_SPLIT_INC_")
+    if v6 or updated.get("INTERNAL_IP6_ADDRESS") or updated.get("INTERNAL_IP6_NETMASK"):
+        updated["CISCO_IPV6_SPLIT_INC"] = str(len(v6)) if v6 else "0"
+        for index, (addr, length) in enumerate(v6):
+            updated[f"CISCO_IPV6_SPLIT_INC_{index}_ADDR"] = addr
+            updated[f"CISCO_IPV6_SPLIT_INC_{index}_MASKLEN"] = length
+    return updated
+
+
+def apply_split_dns(env: dict[str, str], config: str | None) -> None:
+    tundev = env.get("TUNDEV", "")
+    if not tundev or not Path("/usr/bin/resolvectl").exists():
+        return
+    subprocess.run(
+        ["/usr/bin/resolvectl", "default-route", tundev, "false"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    domains = dns_domains(env, config)
+    if domains:
+        subprocess.run(
+            ["/usr/bin/resolvectl", "domain", tundev, *domains],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def vpnc_main() -> int:
+    reason = os.environ.get("reason", "")
+    config = os.environ.get("OCGP_CONFIG", "")
+    env = os.environ.copy()
+    if reason in {"connect", "disconnect", "reconnect"}:
+        env = rewrite_split_env(env, config or None)
+    if not REAL_VPNC.is_file():
+        print(f"missing {REAL_VPNC}", file=sys.stderr)
+        return 1
+    result = subprocess.run([str(REAL_VPNC)], env=env, check=False)
+    if reason == "connect":
+        apply_split_dns(env, config or None)
+    return result.returncode
+
+
+def write_status(payload: dict) -> None:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(RUN_DIR, 0o755)
+    tmp = STATUS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o644)
+    tmp.replace(STATUS_FILE)
+
+
+def read_status_file() -> dict:
+    try:
+        data = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def read_pid() -> int | None:
+    try:
+        text = PID_FILE.read_text(encoding="utf-8").strip()
+        pid = int(text)
+    except (OSError, ValueError):
+        return None
+    return pid
+
+
+def our_openconnect(pid: int) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    cmd = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+    return "openconnect" in cmd and IFACE in cmd
+
+
+def connected_pid() -> int | None:
+    pid = read_pid()
+    if pid and pid_alive(pid) and our_openconnect(pid):
+        return pid
+    return None
+
+
+def ip_json(args: list[str]) -> list:
+    try:
+        raw = subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def iface_ipv4() -> str:
+    for entry in ip_json(["ip", "-j", "addr", "show", "dev", IFACE]):
+        for addr in entry.get("addr_info") or []:
+            if addr.get("family") == "inet":
+                return str(addr.get("local") or "")
+    return ""
+
+
+def iface_routes() -> list[str]:
+    routes = []
+    for entry in ip_json(["ip", "-j", "route", "show", "dev", IFACE]):
+        dst = str(entry.get("dst") or "")
+        if dst:
+            routes.append(dst)
+    for entry in ip_json(["ip", "-6", "-j", "route", "show", "dev", IFACE]):
+        dst = str(entry.get("dst") or "")
+        if dst and dst not in routes:
+            routes.append(dst)
+    return routes
+
+
+def default_route_present(routes: list[str]) -> bool:
+    return any(route in {"default", "0.0.0.0/0", "::/0"} for route in routes)
+
+
+def build_status() -> dict:
+    cfg = {}
+    try:
+        cfg = load_config()
+    except (OSError, json.JSONDecodeError, SystemExit):
+        cfg = default_config()
+    stored = read_status_file()
+    pid = connected_pid()
+    routes = iface_routes() if pid else []
+    ipv4 = iface_ipv4() if pid else ""
+    if pid and ipv4:
+        state = "connected"
+    elif pid or stored.get("state") == "connecting":
+        started = float(stored.get("since") or 0)
+        if pid or time.time() - started < 90:
+            state = "connecting"
+        else:
+            state = "error"
+    elif stored.get("state") == "error":
+        state = "error"
+    else:
+        state = "disconnected"
+    message = "" if state == "connected" else str(stored.get("message") or "")
+    if state == "connected" and not any("/" in route and route not in {"default", "0.0.0.0/0", "::/0"} for route in routes):
+        message = "Tunnel is up with no split routes. Add extra CIDRs, or the portal sent only a full tunnel."
+    if state == "connected" and default_route_present(routes):
+        state = "error"
+        message = "Default route landed on the tunnel. Disconnect. Split tunnel refused to keep it."
+    return {
+        "state": state,
+        "portal": cfg.get("portal") or stored.get("portal") or "",
+        "username": cfg.get("username") or "",
+        "os": cfg.get("os") or "linux",
+        "extra_routes": cfg.get("extra_routes") or [],
+        "dns_domains": cfg.get("dns_domains") or [],
+        "gateway": stored.get("gateway") or "",
+        "ipv4": ipv4,
+        "interface": IFACE,
+        "split": True,
+        "routes": routes,
+        "message": message,
+        "pid": pid,
+        "connected_at": stored.get("connected_at"),
+    }
+
+
+def notify(title: str, body: str) -> None:
+    if not Path("/usr/bin/notify-send").exists():
+        return
+    subprocess.run(
+        ["notify-send", "-a", "openconnect-gp", title, body[:180]],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def prelogin(portal: str) -> dict:
+    host = normalize_portal(portal)
+    url = f"https://{host}/global-protect/prelogin.esp"
+    body = urllib.parse.urlencode(
+        {"tmp": "tmp", "clientVer": "4100", "clientos": "Linux"}
+    ).encode()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "PAN GlobalProtect",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = response.read()
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"prelogin failed: {exc}") from exc
+    root = ET.fromstring(payload)
+    values = {child.tag.split("}")[-1]: (child.text or "").strip() for child in root}
+    saml = bool(values.get("saml-auth-method") or values.get("saml-request"))
+    return {
+        "portal": host,
+        "auth": "browser" if saml else "password",
+        "saml": saml,
+        "username_label": values.get("username-label") or "Username",
+        "password_label": values.get("password-label") or "Password",
+        "message": values.get("authentication-message") or "",
+        "region": values.get("region") or "",
+    }
+
+
+def read_secret() -> tuple[str, str]:
+    if sys.stdin.isatty():
+        password = getpass.getpass("Password: ")
+        return password, ""
+    line = sys.stdin.readline()
+    if not line.strip():
+        raise SystemExit("password missing")
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("password payload is not JSON") from exc
+    if not isinstance(data, dict):
+        raise SystemExit("password payload is not a JSON object")
+    return str(data.get("password") or ""), str(data.get("code") or "")
+
+
+def run_auth(portal: str, username: str, password: str, code: str, os_name: str, browser: bool) -> dict[str, str]:
+    cmd = [
+        "openconnect",
+        "--protocol=gp",
+        "--authenticate",
+        f"--os={os_name}",
+        "--user",
+        username,
+    ]
+    feed = None
+    if browser:
+        cmd.append("--external-browser=xdg-open")
+    else:
+        cmd.append("--passwd-on-stdin")
+        feed = password + "\n"
+        if code:
+            feed += code + "\n"
+    cmd.append(portal)
+    try:
+        result = subprocess.run(
+            cmd,
+            input=feed,
+            text=True,
+            capture_output=True,
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit("authentication timed out") from exc
+    parsed = parse_auth_output(result.stdout)
+    if result.returncode != 0 or "COOKIE" not in parsed or "HOST" not in parsed:
+        detail = scrub(result.stderr) or scrub(result.stdout) or "authentication failed"
+        raise SystemExit(detail)
+    return parsed
+
+
+def invoking_uid() -> int | None:
+    for key in ("PKEXEC_UID", "SUDO_UID"):
+        value = os.environ.get(key, "")
+        if value.isdigit():
+            return int(value)
+    return None
+
+
+def require_root_helper() -> int:
+    if os.geteuid() != 0:
+        raise SystemExit("tunnel helper must run as root through pkexec")
+    uid = invoking_uid()
+    if uid is None:
+        raise SystemExit("refusing to run without PKEXEC_UID")
+    return uid
+
+
+def user_config_ok(uid: int, raw_path: str) -> Path:
+    home = Path(pwd.getpwuid(uid).pw_dir).resolve()
+    path = Path(raw_path).resolve()
+    if path.name != "config.json" or path.parent.name != "openconnect-gp":
+        raise SystemExit("config path refused")
+    if not path.is_relative_to(home):
+        raise SystemExit("config path is outside the invoking user home")
+    return path
+
+
+def lock_run():
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(RUN_DIR, 0o755)
+    handle = LOCK_FILE.open("a+", encoding="utf-8")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def cmd_tunnel() -> int:
+    uid = require_root_helper()
+    line = sys.stdin.readline()
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("tunnel payload is not JSON") from exc
+    if not isinstance(data, dict):
+        raise SystemExit("tunnel payload is not a JSON object")
+    cookie = str(data.get("cookie") or "")
+    host = str(data.get("host") or "")
+    fingerprint = str(data.get("fingerprint") or "")
+    username = check_username(str(data.get("username") or ""))
+    os_name = check_os_name(str(data.get("os") or "linux"))
+    portal = normalize_portal(str(data.get("portal") or host))
+    config = user_config_ok(uid, str(data.get("config") or ""))
+    if not cookie or "\n" in cookie or len(cookie) > 16384:
+        raise SystemExit("cookie refused")
+    if not HOST_RE.fullmatch(host):
+        raise SystemExit("gateway host refused")
+    if fingerprint and not FINGERPRINT_RE.fullmatch(fingerprint):
+        raise SystemExit("fingerprint refused")
+    if not username:
+        raise SystemExit("username missing")
+    if not HIP_SCRIPT.is_file():
+        raise SystemExit(f"missing {HIP_SCRIPT}")
+
+    with lock_run():
+        existing = connected_pid()
+        if existing:
+            print(f"already connected (pid {existing})")
+            return 0
+        write_status(
+            {
+                "state": "connecting",
+                "portal": portal,
+                "gateway": host,
+                "message": "",
+                "since": time.time(),
+                "connected_at": None,
+            }
+        )
+        user = pwd.getpwuid(uid).pw_name
+        script = str(LIB_DIR / "vpnc-split")
+        cmd = [
+            "openconnect",
+            "--protocol=gp",
+            "--cookie-on-stdin",
+            "--background",
+            f"--pid-file={PID_FILE}",
+            f"--interface={IFACE}",
+            f"--script={script}",
+            f"--csd-wrapper={HIP_SCRIPT}",
+            f"--csd-user={user}",
+            "--syslog",
+            f"--os={os_name}",
+            "--user",
+            username,
+        ]
+        if fingerprint:
+            cmd.extend(["--servercert", fingerprint])
+        cmd.append(host)
+        env = os.environ.copy()
+        env["OCGP_CONFIG"] = str(config)
+        env.pop("PKEXEC_UID", None)
+        try:
+            result = subprocess.run(
+                cmd,
+                input=cookie + "\n",
+                text=True,
+                capture_output=True,
+                timeout=90,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            write_status(
+                {
+                    "state": "error",
+                    "portal": portal,
+                    "gateway": host,
+                    "message": "tunnel start timed out",
+                    "since": time.time(),
+                }
+            )
+            return 1
+        if result.returncode != 0:
+            message = scrub(result.stderr) or scrub(result.stdout) or "openconnect failed"
+            write_status(
+                {
+                    "state": "error",
+                    "portal": portal,
+                    "gateway": host,
+                    "message": message,
+                    "since": time.time(),
+                }
+            )
+            print(message, file=sys.stderr)
+            return result.returncode or 1
+        deadline = time.time() + 8
+        while time.time() < deadline and not connected_pid():
+            time.sleep(0.2)
+        write_status(
+            {
+                "state": "connected",
+                "portal": portal,
+                "gateway": host,
+                "message": "",
+                "since": time.time(),
+                "connected_at": time.time(),
+            }
+        )
+        print(f"split tunnel up via {host}")
+        return 0
+
+
+def cmd_disconnect() -> int:
+    require_root_helper()
+    with lock_run():
+        pid = connected_pid()
+        if not pid:
+            write_status({"state": "disconnected", "message": "", "gateway": ""})
+            print("already disconnected")
+            return 0
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.time() + 8
+        while time.time() < deadline and pid_alive(pid):
+            time.sleep(0.2)
+        if pid_alive(pid) and our_openconnect(pid):
+            os.kill(pid, signal.SIGKILL)
+        write_status({"state": "disconnected", "message": "", "gateway": "", "connected_at": None})
+        print("disconnected")
+        return 0
+
+
+def pkexec(mode: str, payload: dict) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["pkexec", str(HELPER), mode],
+        input=json.dumps(payload) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def cmd_connect(browser: bool) -> int:
+    if os.geteuid() == 0:
+        raise SystemExit("run connect as your user. It will call pkexec for the tunnel.")
+    cfg = load_config()
+    portal = normalize_portal(str(cfg.get("portal") or ""))
+    username = check_username(str(cfg.get("username") or ""))
+    os_name = check_os_name(str(cfg.get("os") or "linux"))
+    if not username:
+        raise SystemExit("set a username first: ocgp config set username NAME")
+    if connected_pid():
+        print("already connected")
+        return 0
+    info = prelogin(portal)
+    use_browser = browser or bool(info.get("saml"))
+    password, code = ("", "")
+    if not use_browser:
+        password, code = read_secret()
+        if not password:
+            raise SystemExit("password missing")
+    try:
+        auth = run_auth(portal, username, password, code, os_name, use_browser)
+    except SystemExit as exc:
+        write_user_error(portal, str(exc))
+        notify("GlobalProtect", str(exc)[:180] or "authentication failed")
+        raise
+    finally:
+        password = ""
+    host = auth.get("HOST", "")
+    cookie = auth.get("COOKIE", "")
+    fingerprint = auth.get("FINGERPRINT", "")
+    result = pkexec(
+        "_tunnel",
+        {
+            "cookie": cookie,
+            "host": host,
+            "fingerprint": fingerprint,
+            "username": username,
+            "os": os_name,
+            "portal": portal,
+            "config": str(config_path()),
+        },
+    )
+    cookie = ""
+    detail = scrub(result.stderr) or scrub(result.stdout)
+    if result.returncode != 0:
+        message = detail or "tunnel failed"
+        write_user_error(portal, message)
+        notify("GlobalProtect", message)
+        print(message, file=sys.stderr)
+        return result.returncode
+    notify("GlobalProtect", f"Split tunnel up ({host})")
+    if detail:
+        print(detail)
+    else:
+        print("split tunnel up")
+    return 0
+
+
+def write_user_error(portal: str, message: str) -> None:
+    # The user can write the status file only after the root helper has
+    # created /run/openconnect-gp. If it has not, print and move on.
+    try:
+        if RUN_DIR.is_dir() and os.access(RUN_DIR, os.W_OK):
+            write_status(
+                {
+                    "state": "error",
+                    "portal": portal,
+                    "message": scrub(message),
+                    "since": time.time(),
+                }
+            )
+    except OSError:
+        return
+
+
+def cmd_user_disconnect() -> int:
+    if connected_pid() is None and not PID_FILE.exists():
+        print("already disconnected")
+        return 0
+    result = pkexec("_disconnect", {})
+    detail = scrub(result.stderr) or scrub(result.stdout)
+    if result.returncode != 0:
+        print(detail or "disconnect failed", file=sys.stderr)
+        return result.returncode
+    notify("GlobalProtect", "Disconnected")
+    print(detail or "disconnected")
+    return 0
+
+
+def cmd_config_set(key: str, value: str) -> int:
+    cfg = load_config()
+    if key == "portal":
+        cfg["portal"] = normalize_portal(value)
+    elif key == "username":
+        cfg["username"] = check_username(value)
+    elif key == "os":
+        cfg["os"] = check_os_name(value)
+    elif key == "extra_routes":
+        cfg["extra_routes"] = parse_route_list(value)
+    elif key == "dns_domains":
+        cfg["dns_domains"] = parse_domain_list(value)
+    else:
+        raise SystemExit("unknown config key")
+    save_config(cfg)
+    print(json.dumps({key: cfg[key]}))
+    return 0
+
+
+def cmd_setup() -> int:
+    portal = input("GlobalProtect portal address: ").strip()
+    username = input("Username (blank to set later): ").strip()
+    cfg = load_config()
+    cfg["portal"] = normalize_portal(portal)
+    if username:
+        cfg["username"] = check_username(username)
+    save_config(cfg)
+    print(f"saved {config_path()}")
+    return 0
+
+
+def usage() -> None:
+    print(
+        """Usage: ocgp <command>
+
+  connect              Authenticate, then bring up a split tunnel
+  connect --browser    Sign in with the desktop browser (SAML)
+  disconnect           Stop the tunnel
+  status               Print JSON status
+  prelogin             Show how the portal wants you to sign in
+  config set KEY VALUE Set portal, username, os, extra_routes, dns_domains
+  setup                Ask for portal and username
+
+The tunnel never takes the default route. Gateway split routes are kept.
+extra_routes in the config are added. VPN DNS answers only the portal domains.
+"""
+    )
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2 or argv[1] in {"-h", "--help", "help"}:
+        usage()
+        return 0 if len(argv) > 1 else 1
+    cmd = argv[1]
+    if os.geteuid() == 0 and cmd not in {"_vpnc", "_tunnel", "_disconnect"}:
+        print("refusing to run this command as root", file=sys.stderr)
+        return 1
+    if cmd == "_vpnc":
+        return vpnc_main()
+    if cmd == "_tunnel":
+        return cmd_tunnel()
+    if cmd == "_disconnect":
+        return cmd_disconnect()
+    if cmd == "status":
+        print(json.dumps(build_status()))
+        return 0
+    if cmd == "prelogin":
+        cfg = load_config()
+        portal = argv[2] if len(argv) > 2 else str(cfg.get("portal") or "")
+        print(json.dumps(prelogin(portal)))
+        return 0
+    if cmd == "connect":
+        return cmd_connect("--browser" in argv[2:])
+    if cmd == "disconnect":
+        return cmd_user_disconnect()
+    if cmd == "setup":
+        return cmd_setup()
+    if cmd == "config" and len(argv) >= 5 and argv[2] == "set":
+        return cmd_config_set(argv[3], argv[4])
+    usage()
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv))
+    except BrokenPipeError:
+        raise SystemExit(0)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1)

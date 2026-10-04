@@ -1,0 +1,10 @@
+// Installed by openconnect-gp. Lets one local user connect and disconnect
+// the split tunnel without a password prompt. The helper accepts only
+// _tunnel and _disconnect, and it refuses a config path outside that user's home.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.openconnectgp.manage" &&
+        subject.user == "__USER__" &&
+        subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});
