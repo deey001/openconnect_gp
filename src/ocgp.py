@@ -27,6 +27,9 @@ RUN_DIR = Path("/run/openconnect-gp")
 PID_FILE = RUN_DIR / "openconnect.pid"
 STATUS_FILE = RUN_DIR / "status.json"
 LOCK_FILE = RUN_DIR / "lock"
+COOKIE_FILE = RUN_DIR / "cookie"
+TUNNEL_ENV = RUN_DIR / "tunnel.env"
+SERVICE = "ocgp.service"
 REAL_VPNC = Path("/etc/vpnc/vpnc-script")
 HIP_SCRIPT = Path("/usr/lib/openconnect/hipreport.sh")
 LIB_DIR = Path("/usr/local/lib/openconnect-gp")
@@ -415,6 +418,17 @@ def default_route_present(routes: list[str]) -> bool:
     return any(route in {"default", "0.0.0.0/0", "::/0"} for route in routes)
 
 
+def phase_state(stored_state: str, pid: int | None, ipv4: str, since: float, now: float) -> str:
+    """What the panel should show. A dead process is never connected."""
+    if pid and ipv4:
+        return "connected"
+    if pid or (stored_state == "connecting" and now - since < 90):
+        return "connecting"
+    if stored_state == "error" or (stored_state == "connected" and not pid):
+        return "error"
+    return "disconnected"
+
+
 def build_status() -> dict:
     cfg = {}
     try:
@@ -425,19 +439,11 @@ def build_status() -> dict:
     pid = connected_pid()
     routes = iface_routes() if pid else []
     ipv4 = iface_ipv4() if pid else ""
-    if pid and ipv4:
-        state = "connected"
-    elif pid or stored.get("state") == "connecting":
-        started = float(stored.get("since") or 0)
-        if pid or time.time() - started < 90:
-            state = "connecting"
-        else:
-            state = "error"
-    elif stored.get("state") == "error":
-        state = "error"
-    else:
-        state = "disconnected"
+    started = float(stored.get("since") or 0)
+    state = phase_state(str(stored.get("state") or ""), pid, ipv4, started, time.time())
     message = "" if state == "connected" else str(stored.get("message") or "")
+    if state == "error" and not message:
+        message = "Tunnel process exited during setup"
     if state == "connected" and not any("/" in route and route not in {"default", "0.0.0.0/0", "::/0"} for route in routes):
         message = "Tunnel is up with no split routes. Add extra CIDRs, or the portal sent only a full tunnel."
     if state == "connected" and default_route_present(routes):
@@ -592,6 +598,106 @@ def lock_run():
     return handle
 
 
+def quote_env(key: str, value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'{key}="{escaped}"'
+
+
+def write_root_file(path: Path, text: str, mode: int) -> None:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(RUN_DIR, 0o755)
+    path.write_text(text, encoding="utf-8")
+    os.chmod(path, mode)
+
+
+def service_journal() -> str:
+    result = subprocess.run(
+        ["journalctl", "-u", SERVICE, "-n", "40", "--no-pager", "-o", "cat"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return scrub(result.stdout) or scrub(result.stderr)
+
+
+def stop_service() -> None:
+    subprocess.run(["systemctl", "stop", SERVICE], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "reset-failed", SERVICE], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_exec_tunnel() -> int:
+    """System-service entry. Opens the tun device outside the user session cgroup."""
+    if os.geteuid() != 0 or os.environ.get("PKEXEC_UID"):
+        print("refusing to start the tunnel outside the system service", file=sys.stderr)
+        return 1
+    if not (os.environ.get("INVOCATION_ID") or os.environ.get("JOURNAL_STREAM")):
+        print("refusing to start the tunnel outside the system service", file=sys.stderr)
+        return 1
+    try:
+        env_text = TUNNEL_ENV.read_text(encoding="utf-8")
+        cookie = COOKIE_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"tunnel secrets missing: {exc}", file=sys.stderr)
+        return 1
+    COOKIE_FILE.unlink(missing_ok=True)
+    TUNNEL_ENV.unlink(missing_ok=True)
+    fields: dict[str, str] = {}
+    for line in env_text.splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        fields[key] = raw[1:-1] if raw.startswith('"') and raw.endswith('"') else raw
+    host = fields.get("OCGP_HOST", "")
+    username = fields.get("OCGP_USER", "")
+    os_name = fields.get("OCGP_OS", "linux")
+    fingerprint = fields.get("OCGP_FINGERPRINT", "")
+    csd_user = fields.get("OCGP_CSD_USER", "")
+    config = fields.get("OCGP_CONFIG", "")
+    try:
+        username = check_username(username)
+        os_name = check_os_name(os_name)
+        if not HOST_RE.fullmatch(host) or not username:
+            raise ValueError("tunnel target refused")
+        if fingerprint and not FINGERPRINT_RE.fullmatch(fingerprint):
+            raise ValueError("fingerprint refused")
+        if csd_user and not USER_RE.fullmatch(csd_user):
+            raise ValueError("csd user refused")
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if not cookie.strip() or "\n" in cookie.strip() or len(cookie) > 16384:
+        print("cookie refused", file=sys.stderr)
+        return 1
+    cmd = [
+        "openconnect",
+        "--protocol=gp",
+        "--cookie-on-stdin",
+        f"--pid-file={PID_FILE}",
+        f"--interface={IFACE}",
+        f"--script={LIB_DIR / 'vpnc-split'}",
+        f"--csd-wrapper={HIP_SCRIPT}",
+        "--syslog",
+        f"--os={os_name}",
+        "--user",
+        username,
+    ]
+    if csd_user:
+        cmd.extend([f"--csd-user={csd_user}"])
+    if fingerprint:
+        cmd.extend(["--servercert", fingerprint])
+    cmd.append(host)
+    env = os.environ.copy()
+    if config:
+        env["OCGP_CONFIG"] = config
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, cookie.encode() if cookie.endswith("\n") else (cookie + "\n").encode())
+    os.close(write_fd)
+    os.dup2(read_fd, 0)
+    os.close(read_fd)
+    os.execvpe(cmd[0], cmd, env)
+    return 1
+
+
 def cmd_tunnel() -> int:
     uid = require_root_helper()
     line = sys.stdin.readline()
@@ -635,51 +741,41 @@ def cmd_tunnel() -> int:
             }
         )
         user = pwd.getpwuid(uid).pw_name
-        script = str(LIB_DIR / "vpnc-split")
-        cmd = [
-            "openconnect",
-            "--protocol=gp",
-            "--cookie-on-stdin",
-            "--background",
-            f"--pid-file={PID_FILE}",
-            f"--interface={IFACE}",
-            f"--script={script}",
-            f"--csd-wrapper={HIP_SCRIPT}",
-            f"--csd-user={user}",
-            "--syslog",
-            f"--os={os_name}",
-            "--user",
-            username,
-        ]
-        if fingerprint:
-            cmd.extend(["--servercert", fingerprint])
-        cmd.append(host)
-        env = os.environ.copy()
-        env["OCGP_CONFIG"] = str(config)
-        env.pop("PKEXEC_UID", None)
-        try:
-            result = subprocess.run(
-                cmd,
-                input=cookie + "\n",
-                text=True,
-                capture_output=True,
-                timeout=90,
-                check=False,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            write_status(
-                {
-                    "state": "error",
-                    "portal": portal,
-                    "gateway": host,
-                    "message": "tunnel start timed out",
-                    "since": time.time(),
-                }
-            )
-            return 1
-        if result.returncode != 0:
-            message = scrub(result.stderr) or scrub(result.stdout) or "openconnect failed"
+        env_body = "\n".join(
+            [
+                quote_env("OCGP_HOST", host),
+                quote_env("OCGP_USER", username),
+                quote_env("OCGP_OS", os_name),
+                quote_env("OCGP_FINGERPRINT", fingerprint),
+                quote_env("OCGP_CSD_USER", user),
+                quote_env("OCGP_CONFIG", str(config)),
+                quote_env("OCGP_PORTAL", portal),
+            ]
+        ) + "\n"
+        write_root_file(TUNNEL_ENV, env_body, 0o600)
+        write_root_file(COOKIE_FILE, cookie if cookie.endswith("\n") else cookie + "\n", 0o600)
+        stop_service()
+        started = subprocess.run(
+            [
+                "systemd-run",
+                "--system",
+                "--collect",
+                "--unit",
+                "ocgp",
+                "--description",
+                "openconnect-gp split tunnel",
+                "--no-block",
+                "/usr/local/bin/ocgp",
+                "_exec-tunnel",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if started.returncode != 0:
+            COOKIE_FILE.unlink(missing_ok=True)
+            TUNNEL_ENV.unlink(missing_ok=True)
+            message = scrub(started.stderr) or scrub(started.stdout) or "systemd-run failed"
             write_status(
                 {
                     "state": "error",
@@ -690,38 +786,66 @@ def cmd_tunnel() -> int:
                 }
             )
             print(message, file=sys.stderr)
-            return result.returncode or 1
-        deadline = time.time() + 8
-        while time.time() < deadline and not connected_pid():
-            time.sleep(0.2)
+            return started.returncode or 1
+        deadline = time.time() + 45
+        seen_active = False
+        while time.time() < deadline:
+            if connected_pid() and iface_ipv4():
+                COOKIE_FILE.unlink(missing_ok=True)
+                write_status(
+                    {
+                        "state": "connected",
+                        "portal": portal,
+                        "gateway": host,
+                        "message": "",
+                        "since": time.time(),
+                        "connected_at": time.time(),
+                    }
+                )
+                print(f"split tunnel up via {host}")
+                return 0
+            active = subprocess.run(
+                ["systemctl", "is-active", SERVICE],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            unit_state = active.stdout.strip()
+            if unit_state in {"active", "activating"}:
+                seen_active = True
+            if unit_state == "failed" or (seen_active and unit_state in {"inactive", "dead"}):
+                break
+            time.sleep(0.4)
+        COOKIE_FILE.unlink(missing_ok=True)
+        message = service_journal() or "Failed to open the tunnel"
+        stop_service()
         write_status(
             {
-                "state": "connected",
+                "state": "error",
                 "portal": portal,
                 "gateway": host,
-                "message": "",
+                "message": message,
                 "since": time.time(),
-                "connected_at": time.time(),
             }
         )
-        print(f"split tunnel up via {host}")
-        return 0
+        print(message, file=sys.stderr)
+        return 1
 
 
 def cmd_disconnect() -> int:
     require_root_helper()
     with lock_run():
+        stop_service()
         pid = connected_pid()
-        if not pid:
-            write_status({"state": "disconnected", "message": "", "gateway": ""})
-            print("already disconnected")
-            return 0
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.time() + 8
-        while time.time() < deadline and pid_alive(pid):
-            time.sleep(0.2)
-        if pid_alive(pid) and our_openconnect(pid):
-            os.kill(pid, signal.SIGKILL)
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.time() + 8
+            while time.time() < deadline and pid_alive(pid):
+                time.sleep(0.2)
+            if pid_alive(pid) and our_openconnect(pid):
+                os.kill(pid, signal.SIGKILL)
+        COOKIE_FILE.unlink(missing_ok=True)
+        TUNNEL_ENV.unlink(missing_ok=True)
         write_status({"state": "disconnected", "message": "", "gateway": "", "connected_at": None})
         print("disconnected")
         return 0
@@ -880,11 +1004,13 @@ def main(argv: list[str]) -> int:
         usage()
         return 0 if len(argv) > 1 else 1
     cmd = argv[1]
-    if os.geteuid() == 0 and cmd not in {"_vpnc", "_tunnel", "_disconnect"}:
+    if os.geteuid() == 0 and cmd not in {"_vpnc", "_tunnel", "_disconnect", "_exec-tunnel"}:
         print("refusing to run this command as root", file=sys.stderr)
         return 1
     if cmd == "_vpnc":
         return vpnc_main()
+    if cmd == "_exec-tunnel":
+        return cmd_exec_tunnel()
     if cmd == "_tunnel":
         return cmd_tunnel()
     if cmd == "_disconnect":

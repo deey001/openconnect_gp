@@ -94,6 +94,17 @@ class SplitTests(unittest.TestCase):
         return path
 
 
+class PhaseTests(unittest.TestCase):
+    def test_dead_process_is_an_error_even_if_status_said_connected(self):
+        self.assertEqual(ocgp.phase_state("connected", None, "", 0, 10), "error")
+
+    def test_live_tunnel_is_connected(self):
+        self.assertEqual(ocgp.phase_state("connecting", 10, "10.9.0.4", 0, 5), "connected")
+
+    def test_recent_start_stays_connecting(self):
+        self.assertEqual(ocgp.phase_state("connecting", None, "", 100, 120), "connecting")
+
+
 class AuthParseTests(unittest.TestCase):
     def test_parses_cookie_block(self):
         text = "COOKIE='abc123'\nHOST='10.1.2.3'\nFINGERPRINT='pin-sha256:abcd'\nnoise\n"
