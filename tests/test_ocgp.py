@@ -1,7 +1,9 @@
+import errno
 import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import ocgp
@@ -92,6 +94,20 @@ class SplitTests(unittest.TestCase):
         path.write_text(json.dumps({"dns_domains": domains}), encoding="utf-8")
         self.addCleanup(path.unlink, missing_ok=True)
         return path
+
+
+class PidTests(unittest.TestCase):
+    def test_eperm_means_the_root_process_exists(self):
+        with mock.patch("ocgp.os.kill", side_effect=PermissionError(errno.EPERM, "Operation not permitted")):
+            self.assertTrue(ocgp.pid_alive(1039512))
+
+    def test_esrch_means_the_process_exited(self):
+        with mock.patch("ocgp.os.kill", side_effect=ProcessLookupError(errno.ESRCH, "No such process")):
+            self.assertFalse(ocgp.pid_alive(1039512))
+
+    def test_non_positive_pid_is_dead(self):
+        self.assertFalse(ocgp.pid_alive(0))
+        self.assertFalse(ocgp.pid_alive(-1))
 
 
 class PhaseTests(unittest.TestCase):

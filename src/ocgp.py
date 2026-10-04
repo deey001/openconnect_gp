@@ -6,6 +6,7 @@ Password and cookie stay off argv. The default route is never installed.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import getpass
 import json
@@ -347,12 +348,17 @@ def read_status_file() -> dict:
 
 
 def pid_alive(pid: int) -> bool:
+    """True when the pid exists.
+
+    Signal 0 does not kill the process. A root OpenConnect returns EPERM to
+    the desktop user; that still means the pid is alive. ESRCH means it exited.
+    """
     if pid <= 0:
         return False
     try:
         os.kill(pid, 0)
-    except OSError:
-        return False
+    except OSError as exc:
+        return exc.errno == errno.EPERM
     return True
 
 
