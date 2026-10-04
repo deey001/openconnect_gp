@@ -14,8 +14,12 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color dim: Qt.darker(foreground, 1.45)
+  readonly property color ready: "#3DDC97"
+  property bool splitUp: false
+  property bool hipOk: false
   readonly property color iconColor: {
     if (stateName === "error") return urgent
+    if (stateName === "connected" && splitUp && hipOk) return ready
     if (stateName === "connected" || stateName === "connecting") return foreground
     return dim
   }
@@ -51,6 +55,32 @@ Panel {
     return "Offline"
   }
 
+  function liveSplit(routeList) {
+    for (var i = 0; i < routeList.length; i++) {
+      var route = String(routeList[i])
+      if (route === "default" || route === "0.0.0.0/0" || route === "::/0" || route === "fe80::/64") continue
+      if (route.indexOf("/") >= 0) return true
+    }
+    return false
+  }
+
+  function noteHipJournal(text) {
+    if (stateName !== "connected") {
+      hipOk = false
+      return
+    }
+    var passed = false
+    var lines = text.split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i]
+      var lower = line.toLowerCase()
+      if (line.indexOf("HIP report submitted successfully") >= 0) passed = true
+      else if (lower.indexOf("hip") >= 0 && (lower.indexOf("fail") >= 0 || lower.indexOf("denied") >= 0 || lower.indexOf("refused") >= 0 || lower.indexOf("error") >= 0))
+        passed = false
+    }
+    hipOk = passed
+  }
+
   function hipValueFor(stored) {
     if (stored === "win") return "win"
     if (stored === "apple-silicon" || stored === "mac-intel") return "apple-silicon"
@@ -77,6 +107,11 @@ Panel {
     if (!portalField.activeFocus) portal = String(data.portal || "")
     if (!usernameField.activeFocus) username = String(data.username || "")
     if (!osSavePending()) hipOs = hipValueFor(String(data.os || "linux"))
+    splitUp = data.split_up === true || (data.split_up === undefined && stateName === "connected" && liveSplit(data.routes || []))
+    if (data.hip === true || data.hip === false) hipOk = data.hip === true
+    else if (stateName === "connected") {
+      if (!hipProc.running) hipProc.running = true
+    } else hipOk = false
     gateway = String(data.gateway || "")
     ipv4 = String(data.ipv4 || "")
     routes = data.routes || []
@@ -224,6 +259,15 @@ Panel {
   }
 
   Process {
+    id: hipProc
+    command: ["journalctl", "-u", "ocgp.service", "-n", "200", "--no-pager", "-o", "cat"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.noteHipJournal(text)
+    }
+  }
+
+  Process {
     id: preloginProc
     command: [root.ocgpBin, "prelogin"]
     stdout: StdioCollector {
@@ -339,7 +383,7 @@ Panel {
           VpnIcon {
             id: heroIcon
             iconSize: Style.font.display
-            color: root.foreground
+            color: root.iconColor
             badgeColor: root.urgent
             connected: root.stateName === "connected"
             failed: root.stateName === "error"

@@ -45,7 +45,7 @@ Remove it with `./uninstall.sh`. That asks before deleting, and it leaves `~/.co
 
 ## Use
 
-Left click the gate icon to open the panel. Right click connects or disconnects. The password is sent on stdin and is not written to disk, argv, or the status file.
+Left click the gate icon to open the panel. Right click connects or disconnects. The gate turns green when the tunnel is up, split routes are installed, and the gateway has accepted the HIP report. The password is sent on stdin and is not written to disk, argv, or the status file.
 
 ```bash
 ocgp connect

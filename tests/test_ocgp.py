@@ -164,6 +164,28 @@ class JournalTests(unittest.TestCase):
         self.assertIn("Set up tun device failed", text)
         self.assertNotIn("HIP Trojan", text)
 
+    def test_gateway_accepts_the_hip_report(self):
+        journal = "\n".join(
+            [
+                "Trying to run HIP Trojan script '/usr/lib/openconnect/hipreport.sh'.",
+                "HIP script completed successfully (report is 4306 bytes).",
+                "HIP report submitted successfully.",
+            ]
+        )
+        self.assertTrue(ocgp.hip_passed(journal))
+
+    def test_local_hip_script_is_not_gateway_acceptance(self):
+        self.assertFalse(ocgp.hip_passed("HIP script completed successfully (report is 100 bytes)."))
+
+    def test_later_hip_failure_clears_acceptance(self):
+        journal = "HIP report submitted successfully.\nHIP report failed: denied\n"
+        self.assertFalse(ocgp.hip_passed(journal))
+
+    def test_live_split_ignores_link_local_and_default(self):
+        self.assertFalse(ocgp.live_split(["fe80::/64"]))
+        self.assertFalse(ocgp.live_split(["default", "10.0.0.0/8"]))
+        self.assertTrue(ocgp.live_split(["10.0.0.0/8", "fe80::/64"]))
+
     def test_cookie_line_still_dropped(self):
         journal = "COOKIE='secret'\nFailed to open tun device: Operation not permitted\n"
         text = ocgp.tunnel_failure_text(journal)

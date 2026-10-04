@@ -483,6 +483,7 @@ def build_status() -> dict:
     if state == "connected" and default_route_present(routes):
         state = "error"
         message = "Default route landed on the tunnel. Disconnect. Split tunnel refused to keep it."
+    split_up = state == "connected" and live_split(routes)
     return {
         "state": state,
         "portal": cfg.get("portal") or stored.get("portal") or "",
@@ -494,6 +495,8 @@ def build_status() -> dict:
         "ipv4": ipv4,
         "interface": IFACE,
         "split": True,
+        "split_up": split_up,
+        "hip": split_up and hip_passed(current_service_journal()),
         "routes": routes,
         "message": message,
         "pid": pid,
@@ -652,6 +655,62 @@ def service_journal() -> str:
         check=False,
     )
     return result.stdout or result.stderr or ""
+
+
+def current_service_journal() -> str:
+    """Journal for this ocgp.service invocation only. An older HIP line must not count."""
+    show = subprocess.run(
+        ["systemctl", "show", SERVICE, "-p", "ActiveState", "-p", "InvocationID", "--no-pager"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    fields = {}
+    for line in (show.stdout or "").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        fields[key] = value.strip()
+    invocation = fields.get("InvocationID") or ""
+    if fields.get("ActiveState") != "active" or not invocation:
+        return ""
+    result = subprocess.run(
+        [
+            "journalctl",
+            "-u",
+            SERVICE,
+            f"_SYSTEMD_INVOCATION_ID={invocation}",
+            "--no-pager",
+            "-o",
+            "cat",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout or ""
+
+
+def hip_passed(journal: str) -> bool:
+    """True after this session's gateway accepted the HIP report.
+
+    A later HIP failure clears it. "HIP script completed" is only the local
+    report being built, not the gateway accepting it.
+    """
+    passed = False
+    for line in journal.splitlines():
+        if "HIP report submitted successfully" in line:
+            passed = True
+            continue
+        lowered = line.lower()
+        if "hip" in lowered and any(word in lowered for word in ("fail", "error", "denied", "refused")):
+            passed = False
+    return passed
+
+
+def live_split(routes: list[str]) -> bool:
+    ignored = {"default", "0.0.0.0/0", "::/0", "fe80::/64"}
+    return any("/" in route and route not in ignored for route in routes) and not default_route_present(routes)
 
 
 def journal_line_benign(line: str) -> bool:
