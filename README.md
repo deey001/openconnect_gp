@@ -71,6 +71,8 @@ ocgp config set os win
 
 Allowed values match OpenConnect: `linux`, `linux-64`, `win`, `mac-intel`, `android`, `apple-ios`.
 
+OpenConnect logs the HIP report as `Trying to run HIP Trojan script`. That is upstream's name for `/usr/lib/openconnect/hipreport.sh`. A line that says the script completed is a normal report, not malware and not a failure. ESP often fails and the tunnel continues over HTTPS.
+
 ## Config
 
 `~/.config/openconnect-gp/config.json`
@@ -88,6 +90,8 @@ Allowed values match OpenConnect: `linux`, `linux-64`, `win`, `mac-intel`, `andr
 ## What root is allowed to do
 
 `pkexec` runs `/usr/local/bin/ocgp` only for `_tunnel` and `_disconnect`. The tunnel command checks the cookie, host, username, and OS, and it refuses a config path outside the invoking user's `openconnect-gp` directory. It then starts a system service, `ocgp.service`, so OpenConnect can open `/dev/net/tun`. A user-session `pkexec` stays in the session cgroup, and Omarchy closes that cgroup to the session devices. The script passed to OpenConnect is the split-tunnel wrapper, not a shell string from the portal.
+
+OpenConnect writes `--pid-file` only together with `--background`. The service records its pid before the exec, and the helper treats an address on `ocgp0` as success. It does not stop a tunnel that already has an address.
 
 The polkit rule allows the user who ran `install.sh`. It does not require a logind seat. Omarchy's Wayland session often has none, and polkit would otherwise deny the click with no dialog. Other users still get an admin prompt.
 

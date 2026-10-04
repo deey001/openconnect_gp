@@ -105,6 +105,43 @@ class PhaseTests(unittest.TestCase):
         self.assertEqual(ocgp.phase_state("connecting", None, "", 100, 120), "connecting")
 
 
+class JournalTests(unittest.TestCase):
+    def test_hip_trojan_lines_are_not_a_failure(self):
+        journal = "\n".join(
+            [
+                "Trying to run HIP Trojan script '/usr/lib/openconnect/hipreport.sh'.",
+                "HIP script '/usr/lib/openconnect/hipreport.sh' completed successfully (report is 2285 bytes).",
+                "POST https://65.87.76.8/ssl-vpn/hipreport.esp",
+                "HIP report submitted successfully.",
+                "Failed to connect ESP tunnel; using HTTPS instead.",
+                "Configured as 10.190.177.158, with SSL connected and ESP unsuccessful",
+                "Session authentication will expire at Tue, 03 Nov 2026 10:50:47 EST",
+                "Using vhost-net for tun acceleration, ring size 32",
+                "Server certificate verify failed: signer not found",
+            ]
+        )
+        self.assertEqual(ocgp.tunnel_failure_text(journal), "")
+
+    def test_tun_denial_stays_visible(self):
+        journal = "\n".join(
+            [
+                "Trying to run HIP Trojan script '/usr/lib/openconnect/hipreport.sh'.",
+                "Failed to open tun device: Operation not permitted",
+                "Set up tun device failed",
+            ]
+        )
+        text = ocgp.tunnel_failure_text(journal)
+        self.assertIn("Failed to open tun device: Operation not permitted", text)
+        self.assertIn("Set up tun device failed", text)
+        self.assertNotIn("HIP Trojan", text)
+
+    def test_cookie_line_still_dropped(self):
+        journal = "COOKIE='secret'\nFailed to open tun device: Operation not permitted\n"
+        text = ocgp.tunnel_failure_text(journal)
+        self.assertNotIn("secret", text)
+        self.assertIn("Failed to open tun device", text)
+
+
 class AuthParseTests(unittest.TestCase):
     def test_parses_cookie_block(self):
         text = "COOKIE='abc123'\nHOST='10.1.2.3'\nFINGERPRINT='pin-sha256:abcd'\nnoise\n"

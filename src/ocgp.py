@@ -374,10 +374,30 @@ def our_openconnect(pid: int) -> bool:
     return "openconnect" in cmd and IFACE in cmd
 
 
+def service_main_pid() -> int | None:
+    try:
+        raw = subprocess.check_output(
+            ["systemctl", "show", SERVICE, "-p", "MainPID", "--value"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    text = raw.strip()
+    if text.isdigit() and int(text) > 0:
+        return int(text)
+    return None
+
+
 def connected_pid() -> int | None:
-    pid = read_pid()
-    if pid and pid_alive(pid) and our_openconnect(pid):
-        return pid
+    """Pid of the live tunnel. OpenConnect writes --pid-file only with --background."""
+    seen: set[int] = set()
+    for pid in (read_pid(), service_main_pid()):
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        if pid_alive(pid) and our_openconnect(pid):
+            return pid
     return None
 
 
@@ -612,12 +632,50 @@ def write_root_file(path: Path, text: str, mode: int) -> None:
 
 def service_journal() -> str:
     result = subprocess.run(
-        ["journalctl", "-u", SERVICE, "-n", "40", "--no-pager", "-o", "cat"],
+        ["journalctl", "-u", SERVICE, "-n", "80", "--no-pager", "-o", "cat"],
         text=True,
         capture_output=True,
         check=False,
     )
-    return scrub(result.stdout) or scrub(result.stderr)
+    return result.stdout or result.stderr or ""
+
+
+def journal_line_benign(line: str) -> bool:
+    """OpenConnect progress that is not a tunnel failure.
+
+    "HIP Trojan script" is upstream's name for hipreport.sh. ESP falling
+    back to HTTPS still leaves a working SSL tunnel.
+    """
+    markers = (
+        "HIP Trojan",
+        "HIP script",
+        "HIP report submitted",
+        "hipreport.esp",
+        "hipreportcheck",
+        "Failed to connect ESP tunnel",
+        "using HTTPS instead",
+        "Configured as ",
+        "with SSL connected",
+        "Session authentication will expire",
+        "vhost-net",
+        "signer not found",
+        "Server certificate verify failed",
+    )
+    return any(marker in line for marker in markers)
+
+
+def tunnel_failure_text(journal: str) -> str:
+    kept = []
+    for line in journal.splitlines():
+        lowered = line.lower()
+        if "cookie" in lowered or "password" in lowered or "passwd" in lowered:
+            continue
+        if journal_line_benign(line):
+            continue
+        text = line.strip()
+        if text:
+            kept.append(text)
+    return "\n".join(kept[-8:])[:500]
 
 
 def stop_service() -> None:
@@ -668,6 +726,14 @@ def cmd_exec_tunnel() -> int:
     if not cookie.strip() or "\n" in cookie.strip() or len(cookie) > 16384:
         print("cookie refused", file=sys.stderr)
         return 1
+    # --pid-file is written only when OpenConnect backgrounds itself. This
+    # process execs OpenConnect, so the pid stays the same.
+    try:
+        PID_FILE.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        os.chmod(PID_FILE, 0o644)
+    except OSError as exc:
+        print(f"pid file: {exc}", file=sys.stderr)
+        return 1
     cmd = [
         "openconnect",
         "--protocol=gp",
@@ -694,7 +760,12 @@ def cmd_exec_tunnel() -> int:
     os.close(write_fd)
     os.dup2(read_fd, 0)
     os.close(read_fd)
-    os.execvpe(cmd[0], cmd, env)
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except OSError as exc:
+        PID_FILE.unlink(missing_ok=True)
+        print(str(exc), file=sys.stderr)
+        return 1
     return 1
 
 
@@ -787,22 +858,28 @@ def cmd_tunnel() -> int:
             )
             print(message, file=sys.stderr)
             return started.returncode or 1
+
+        def mark_up() -> bool:
+            if not (connected_pid() and iface_ipv4()):
+                return False
+            COOKIE_FILE.unlink(missing_ok=True)
+            write_status(
+                {
+                    "state": "connected",
+                    "portal": portal,
+                    "gateway": host,
+                    "message": "",
+                    "since": time.time(),
+                    "connected_at": time.time(),
+                }
+            )
+            print(f"split tunnel up via {host}")
+            return True
+
         deadline = time.time() + 45
         seen_active = False
         while time.time() < deadline:
-            if connected_pid() and iface_ipv4():
-                COOKIE_FILE.unlink(missing_ok=True)
-                write_status(
-                    {
-                        "state": "connected",
-                        "portal": portal,
-                        "gateway": host,
-                        "message": "",
-                        "since": time.time(),
-                        "connected_at": time.time(),
-                    }
-                )
-                print(f"split tunnel up via {host}")
+            if mark_up():
                 return 0
             active = subprocess.run(
                 ["systemctl", "is-active", SERVICE],
@@ -816,9 +893,34 @@ def cmd_tunnel() -> int:
             if unit_state == "failed" or (seen_active and unit_state in {"inactive", "dead"}):
                 break
             time.sleep(0.4)
+        if mark_up():
+            return 0
+        # An address means the tun device is already up. Stopping the unit
+        # here logs the user out of a working tunnel.
+        if iface_ipv4():
+            extra = time.time() + 10
+            while time.time() < extra:
+                if mark_up():
+                    return 0
+                time.sleep(0.4)
+            COOKIE_FILE.unlink(missing_ok=True)
+            message = "Tunnel has an address but its process was not found. It was left running."
+            write_status(
+                {
+                    "state": "error",
+                    "portal": portal,
+                    "gateway": host,
+                    "message": message,
+                    "since": time.time(),
+                }
+            )
+            print(message, file=sys.stderr)
+            return 1
         COOKIE_FILE.unlink(missing_ok=True)
-        message = service_journal() or "Failed to open the tunnel"
+        TUNNEL_ENV.unlink(missing_ok=True)
+        message = tunnel_failure_text(service_journal()) or "Failed to open the tunnel"
         stop_service()
+        PID_FILE.unlink(missing_ok=True)
         write_status(
             {
                 "state": "error",
@@ -846,6 +948,7 @@ def cmd_disconnect() -> int:
                 os.kill(pid, signal.SIGKILL)
         COOKIE_FILE.unlink(missing_ok=True)
         TUNNEL_ENV.unlink(missing_ok=True)
+        PID_FILE.unlink(missing_ok=True)
         write_status({"state": "disconnected", "message": "", "gateway": "", "connected_at": None})
         print("disconnected")
         return 0
