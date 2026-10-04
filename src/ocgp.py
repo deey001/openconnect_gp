@@ -35,7 +35,11 @@ REAL_VPNC = Path("/etc/vpnc/vpnc-script")
 HIP_SCRIPT = Path("/usr/lib/openconnect/hipreport.sh")
 LIB_DIR = Path("/usr/local/lib/openconnect-gp")
 HELPER = Path("/usr/local/bin/ocgp")
-OS_CHOICES = {"linux", "linux-64", "win", "mac-intel", "android", "apple-ios"}
+OS_CHOICES = {"linux", "linux-64", "win", "mac-intel", "apple-silicon", "android", "apple-ios"}
+# OpenConnect 9.21 accepts only mac-intel for a Mac. That value selects the
+# Mac HIP report. apple-silicon keeps the same report and replaces the
+# Intel-era 10.16.0 fallback with a current macOS version.
+OPENCONNECT_OS = {"apple-silicon": "mac-intel"}
 PORTAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
 USER_RE = re.compile(r"^[\w.@\\-]{1,128}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
@@ -106,6 +110,10 @@ def check_os_name(value: str) -> str:
     if text not in OS_CHOICES:
         raise ValueError(f"os must be one of: {', '.join(sorted(OS_CHOICES))}")
     return text
+
+
+def openconnect_os(os_name: str) -> str:
+    return OPENCONNECT_OS.get(os_name, os_name)
 
 
 def ipv4_ok(addr: str) -> bool:
@@ -558,7 +566,7 @@ def run_auth(portal: str, username: str, password: str, code: str, os_name: str,
         "openconnect",
         "--protocol=gp",
         "--authenticate",
-        f"--os={os_name}",
+        f"--os={openconnect_os(os_name)}",
         "--user",
         username,
     ]
@@ -747,9 +755,9 @@ def cmd_exec_tunnel() -> int:
         f"--pid-file={PID_FILE}",
         f"--interface={IFACE}",
         f"--script={LIB_DIR / 'vpnc-split'}",
-        f"--csd-wrapper={HIP_SCRIPT}",
+        f"--csd-wrapper={LIB_DIR / 'hip-wrapper'}",
         "--syslog",
-        f"--os={os_name}",
+        f"--os={openconnect_os(os_name)}",
         "--user",
         username,
     ]
@@ -761,6 +769,8 @@ def cmd_exec_tunnel() -> int:
     env = os.environ.copy()
     if config:
         env["OCGP_CONFIG"] = config
+    if os_name == "apple-silicon":
+        env["OCGP_HIP_PROFILE"] = "apple-silicon"
     read_fd, write_fd = os.pipe()
     os.write(write_fd, cookie.encode() if cookie.endswith("\n") else (cookie + "\n").encode())
     os.close(write_fd)

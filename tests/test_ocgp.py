@@ -110,6 +110,19 @@ class PidTests(unittest.TestCase):
         self.assertFalse(ocgp.pid_alive(-1))
 
 
+class OsTests(unittest.TestCase):
+    def test_apple_silicon_is_accepted(self):
+        self.assertEqual(ocgp.check_os_name("apple-silicon"), "apple-silicon")
+
+    def test_apple_silicon_selects_the_mac_hip_report(self):
+        self.assertEqual(ocgp.openconnect_os("apple-silicon"), "mac-intel")
+        self.assertEqual(ocgp.openconnect_os("win"), "win")
+
+    def test_unknown_os_is_refused(self):
+        with self.assertRaises(ValueError):
+            ocgp.check_os_name("macos")
+
+
 class PhaseTests(unittest.TestCase):
     def test_dead_process_is_an_error_even_if_status_said_connected(self):
         self.assertEqual(ocgp.phase_state("connected", None, "", 0, 10), "error")

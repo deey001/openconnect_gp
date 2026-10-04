@@ -1,0 +1,11 @@
+#!/bin/sh
+# OpenConnect runs this instead of hipreport.sh. The stock script is unchanged.
+# On Linux it has no sw_vers, so a Mac report falls back to version 10.16.0.
+# That is the version old programs used for Intel Macs. Apple Silicon reports
+# the version from sw_vers, which this profile supplies.
+if [ "${OCGP_HIP_PROFILE:-}" = "apple-silicon" ]; then
+  here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+  PATH="$here/apple-silicon:${PATH:-/usr/bin}"
+  export PATH
+fi
+exec /usr/lib/openconnect/hipreport.sh "$@"

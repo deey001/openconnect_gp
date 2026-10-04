@@ -106,8 +106,10 @@ echo "Installing CLI to $BIN_PATH"
 echo "Polkit will let user $(id -un) connect and disconnect without a password prompt."
 echo "The helper only starts or stops this tunnel."
 
-sudo install -d -m 755 "$LIB_DIR"
+sudo install -d -m 755 "$LIB_DIR" "$LIB_DIR/apple-silicon"
 sudo install -m 644 "$ROOT/src/ocgp.py" "$LIB_DIR/ocgp.py"
+sudo install -m 755 "$ROOT/share/hip-wrapper" "$LIB_DIR/hip-wrapper"
+sudo install -m 755 "$ROOT/share/apple-silicon/sw_vers" "$LIB_DIR/apple-silicon/sw_vers"
 sudo tee "$BIN_PATH" >/dev/null <<EOF
 #!/usr/bin/env python3
 import runpy

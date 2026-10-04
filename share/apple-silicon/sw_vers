@@ -1,0 +1,3 @@
+#!/bin/sh
+# Product version sw_vers prints on a current Apple Silicon Mac.
+echo "26.0"

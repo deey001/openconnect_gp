@@ -66,10 +66,11 @@ printf '%s\n' '{"password":"...","code":"123456"}' | ocgp connect
 If a gateway rejects a Linux HIP report, set the reported OS and reconnect:
 
 ```bash
+ocgp config set os apple-silicon
 ocgp config set os win
 ```
 
-Allowed values match OpenConnect: `linux`, `linux-64`, `win`, `mac-intel`, `android`, `apple-ios`.
+`apple-silicon` sends the Mac HIP report: Xprotect, Gatekeeper, FileVault, and the built-in firewall, with macOS 26.0. OpenConnect 9.21 has no Apple Silicon token, so the client still passes `--os=mac-intel` to select that report. The report text does not say Intel. `win` sends the Windows report. The other OpenConnect values are `linux`, `linux-64`, `mac-intel`, `android`, and `apple-ios`.
 
 OpenConnect logs the HIP report as `Trying to run HIP Trojan script`. That is upstream's name for `/usr/lib/openconnect/hipreport.sh`. A line that says the script completed is a normal report, not malware and not a failure. ESP often fails and the tunnel continues over HTTPS.
 
