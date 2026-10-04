@@ -63,7 +63,7 @@ ocgp connect --browser
 printf '%s\n' '{"password":"...","code":"123456"}' | ocgp connect
 ```
 
-The panel has a HIP report menu: Windows, Linux, or Apple. The same choice from a terminal, then reconnect:
+The panel has three HIP report buttons under the title: Windows, Linux, and Apple. The choice is sent on the next connect. The same choice from a terminal:
 
 ```bash
 ocgp config set os apple-silicon

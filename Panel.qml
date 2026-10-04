@@ -29,11 +29,6 @@ Panel {
   property string usernameLabel: "Username"
   property string passwordLabel: "Password"
   property string hipOs: "linux"
-  readonly property var hipOptions: [
-    { value: "win", label: "Windows" },
-    { value: "linux", label: "Linux" },
-    { value: "apple-silicon", label: "Apple" }
-  ]
   property var routes: []
   property var extraRoutes: []
   property bool acting: false
@@ -45,8 +40,8 @@ Panel {
 
   readonly property var phrases: ["Opening the gate", "Asking the portal", "Leaving home traffic home", "Pinning split routes", "Checking the routes"]
   readonly property var sections: passwordVisible
-    ? ["header", "portal", "username", "hip", "password", "code", "routes", "action"]
-    : ["header", "portal", "username", "hip", "routes", "action"]
+    ? ["header", "hip", "portal", "username", "password", "code", "routes", "action"]
+    : ["header", "hip", "portal", "username", "routes", "action"]
   readonly property bool passwordVisible: stateName !== "connected"
   readonly property bool up: stateName === "connected" || stateName === "connecting"
   readonly property string heroStatus: {
@@ -81,16 +76,26 @@ Panel {
     stateName = String(data.state || "disconnected")
     if (!portalField.activeFocus) portal = String(data.portal || "")
     if (!usernameField.activeFocus) username = String(data.username || "")
-    if (!hipMenu.popupOpen) {
-      hipOs = hipValueFor(String(data.os || "linux"))
-      hipMenu.value = hipOs
-    }
+    if (!osSavePending()) hipOs = hipValueFor(String(data.os || "linux"))
     gateway = String(data.gateway || "")
     ipv4 = String(data.ipv4 || "")
     routes = data.routes || []
     extraRoutes = data.extra_routes || []
     if (!routesField.activeFocus) routesField.text = extraRoutes.join(", ")
     if (stateName !== "connecting") message = String(data.message || "")
+  }
+
+  function osSavePending() {
+    if (saveProc.running && saveProc.command.length > 3 && String(saveProc.command[3]) === "os") return true
+    for (var i = 0; i < saveQueue.length; i++) {
+      if (saveQueue[i][0] === "os") return true
+    }
+    return false
+  }
+
+  function chooseHip(value) {
+    hipOs = value
+    saveKey("os", value)
   }
 
   function saveKey(key, value) {
@@ -180,8 +185,12 @@ Panel {
   function activateCursor() {
     if (focusSection === "header" || focusSection === "action") toggleTunnel()
     else if (focusSection === "portal") portalField.forceActiveFocus()
+    else if (focusSection === "hip") {
+      var order = ["win", "linux", "apple-silicon"]
+      var index = order.indexOf(hipOs)
+      chooseHip(order[(index + 1) % order.length])
+    }
     else if (focusSection === "username") usernameField.forceActiveFocus()
-    else if (focusSection === "hip") hipMenu.toggle()
     else if (focusSection === "password") passwordField.forceActiveFocus()
     else if (focusSection === "code") codeField.forceActiveFocus()
     else if (focusSection === "routes") routesField.forceActiveFocus()
@@ -305,7 +314,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: portalField.activeFocus || usernameField.activeFocus || hipMenu.popupOpen || passwordField.activeFocus || codeField.activeFocus || routesField.activeFocus
+      blocked: portalField.activeFocus || usernameField.activeFocus || passwordField.activeFocus || codeField.activeFocus || routesField.activeFocus
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) root.moveCursor(dy)
       }
@@ -385,6 +394,60 @@ Panel {
         PanelSeparator { foreground: root.foreground }
 
         FieldLabel {
+          text: "HIP REPORT"
+          hot: root.sectionHasCursor("hip")
+          labelColor: root.dim
+          labelFont: root.fontFamily
+        }
+        Row {
+          id: hipRow
+          width: parent.width
+          spacing: Style.space(8)
+
+          Button {
+            width: (hipRow.width - hipRow.spacing * 2) / 3
+            text: "Windows"
+            selected: root.hipOs === "win"
+            bordered: true
+            hasCursor: root.sectionHasCursor("hip") && root.hipOs === "win"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.chooseHip("win")
+            onHovered: function(on) { if (on) { root.cursorActive = true; root.focusSection = "hip" } }
+          }
+          Button {
+            width: (hipRow.width - hipRow.spacing * 2) / 3
+            text: "Linux"
+            selected: root.hipOs === "linux"
+            bordered: true
+            hasCursor: root.sectionHasCursor("hip") && root.hipOs === "linux"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.chooseHip("linux")
+            onHovered: function(on) { if (on) { root.cursorActive = true; root.focusSection = "hip" } }
+          }
+          Button {
+            width: (hipRow.width - hipRow.spacing * 2) / 3
+            text: "Apple"
+            selected: root.hipOs === "apple-silicon"
+            bordered: true
+            hasCursor: root.sectionHasCursor("hip") && root.hipOs === "apple-silicon"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.chooseHip("apple-silicon")
+            onHovered: function(on) { if (on) { root.cursorActive = true; root.focusSection = "hip" } }
+          }
+        }
+        Text {
+          width: parent.width
+          text: "Sent on the next connect."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+        }
+
+        FieldLabel {
           text: "PORTAL"
           hot: root.sectionHasCursor("portal")
           labelColor: root.dim
@@ -425,37 +488,6 @@ Panel {
           onTextEdited: root.username = text
           onEditingFinished: root.saveKey("username", text.trim())
           Keys.onEscapePressed: function(event) { focus = false; event.accepted = true }
-        }
-
-        FieldLabel {
-          text: "HIP REPORT"
-          hot: root.sectionHasCursor("hip")
-          labelColor: root.dim
-          labelFont: root.fontFamily
-        }
-        Dropdown {
-          id: hipMenu
-          width: parent.width
-          showLabel: false
-          value: root.hipOs
-          options: root.hipOptions
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-          hasCursor: root.sectionHasCursor("hip")
-          onHovered: function(on) { if (on) { root.cursorActive = true; root.focusSection = "hip" } }
-          onChanged: function(value) {
-            root.hipOs = value
-            root.saveKey("os", value)
-          }
-          onPopupOpenChanged: if (!popupOpen) keyCatcher.forceActiveFocus()
-        }
-        Text {
-          width: parent.width
-          text: "Windows, Linux, or Apple. Sent on the next connect."
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.Wrap
         }
 
         FieldLabel {
