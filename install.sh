@@ -179,6 +179,8 @@ fi
 
 echo
 echo "Installed. Icon is on the $SECTION side of the bar."
-echo "Portal: $PORTAL"
-echo "Open the icon, type the password, and connect. The password is not saved."
+echo "Portal saved. Open the icon, type the password, and connect. The password is not saved."
 echo "Split tunnel is always on. Add extra CIDRs in the panel if the portal sends none."
+if interactive; then
+  read -r -p "Press enter to close. " _
+fi
