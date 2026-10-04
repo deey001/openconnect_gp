@@ -63,7 +63,7 @@ ocgp connect --browser
 printf '%s\n' '{"password":"...","code":"123456"}' | ocgp connect
 ```
 
-If a gateway rejects a Linux HIP report, set the reported OS and reconnect:
+The panel has a HIP report menu: Windows, Linux, or Apple. The same choice from a terminal, then reconnect:
 
 ```bash
 ocgp config set os apple-silicon
