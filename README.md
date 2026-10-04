@@ -89,7 +89,7 @@ Allowed values match OpenConnect: `linux`, `linux-64`, `win`, `mac-intel`, `andr
 
 `pkexec` runs `/usr/local/bin/ocgp` only for `_tunnel` and `_disconnect`. The tunnel command checks the cookie, host, username, and OS, and it refuses a config path outside the invoking user's `openconnect-gp` directory. The script it passes to OpenConnect is the split-tunnel wrapper, not a shell string from the portal.
 
-The polkit rule is local to the user who ran `install.sh`. Other people still hit the admin prompt, and inactive sessions are denied.
+The polkit rule allows the user who ran `install.sh`. It does not require a logind seat. Omarchy's Wayland session often has none, and polkit would otherwise deny the click with no dialog. Other users still get an admin prompt.
 
 ## License
 

@@ -1,10 +1,13 @@
-// Installed by openconnect-gp. Lets one local user connect and disconnect
-// the split tunnel without a password prompt. The helper accepts only
-// _tunnel and _disconnect, and it refuses a config path outside that user's home.
+// Installed by openconnect-gp. Lets one user connect and disconnect the
+// split tunnel without a password prompt. The helper accepts only _tunnel
+// and _disconnect, and it refuses a config path outside that user's home.
+//
+// Do not require subject.local. Omarchy's Wayland session often has no
+// logind seat, and polkit sets local=false in that case. allow_any in the
+// policy is "no", so the bar click was denied with no password dialog.
 polkit.addRule(function(action, subject) {
     if (action.id == "org.openconnectgp.manage" &&
-        subject.user == "__USER__" &&
-        subject.local && subject.active) {
+        subject.user == "__USER__") {
         return polkit.Result.YES;
     }
 });

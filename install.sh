@@ -123,7 +123,10 @@ EOF
 sudo chmod 755 "$BIN_PATH" "$LIB_DIR/vpnc-split"
 sudo install -Dm644 "$ROOT/share/polkit/org.openconnectgp.policy" /usr/share/polkit-1/actions/org.openconnectgp.policy
 rule="$(sed "s/__USER__/${user_name}/g" "$ROOT/share/polkit/10-openconnect-gp.rules.in")"
-printf '%s\n' "$rule" | sudo tee /etc/polkit-1/rules.d/10-openconnect-gp.rules >/dev/null
+rule_path="/etc/polkit-1/rules.d/10-openconnect-gp.rules"
+printf '%s\n' "$rule" | sudo tee "$rule_path" >/dev/null
+sudo chown root:polkitd "$rule_path"
+sudo chmod 644 "$rule_path"
 if command -v systemctl >/dev/null; then
   sudo systemctl reload polkit || true
 fi
