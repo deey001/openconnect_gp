@@ -1,6 +1,7 @@
 import errno
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -204,6 +205,35 @@ class AuthParseTests(unittest.TestCase):
     def test_scrub_drops_secrets(self):
         text = "Password: secret\nCOOKIE='nope'\nportal refused the HIP report\n"
         self.assertEqual(ocgp.scrub(text), "portal refused the HIP report")
+
+
+class ToolPathTests(unittest.TestCase):
+    def test_debian_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vpnc = root / "vpnc-script"
+            hip = root / "hipreport.sh"
+            binary = root / "openconnect"
+            for path in (vpnc, hip, binary):
+                path.write_text("#!/bin/sh\n", encoding="utf-8")
+                path.chmod(0o755)
+            with mock.patch.object(ocgp, "VPNC_CANDIDATES", (root / "missing", vpnc)):
+                self.assertEqual(ocgp.find_vpnc_script(), vpnc)
+            with mock.patch.object(ocgp, "HIP_CANDIDATES", (root / "missing", hip)):
+                self.assertEqual(ocgp.find_hip_script(), hip)
+            with (
+                mock.patch("ocgp.shutil.which", return_value=None),
+                mock.patch.object(ocgp, "OPENCONNECT_CANDIDATES", (binary,)),
+            ):
+                self.assertEqual(ocgp.openconnect_bin(), str(binary))
+
+    def test_skips_unexecutable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vpnc-script"
+            path.write_text("#!/bin/sh\n", encoding="utf-8")
+            path.chmod(0o644)
+            with mock.patch.object(ocgp, "VPNC_CANDIDATES", (path,)):
+                self.assertIsNone(ocgp.find_vpnc_script())
 
 
 if __name__ == "__main__":

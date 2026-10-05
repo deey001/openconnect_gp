@@ -14,7 +14,16 @@ If the portal sends only a full tunnel, the link still comes up, and no company 
 
 ## Install
 
-Needs `openconnect`, `python3`, `vpnc` (for `/etc/vpnc/vpnc-script`), and, for the icon, Omarchy 4.
+`./install.sh` reads `/etc/os-release` and installs the packages for that distro.
+
+| Family | Distros | Packages |
+| --- | --- | --- |
+| Arch | Arch, Omarchy | `openconnect`, `vpnc`, `python`, `polkit` |
+| Debian | Zorin, Ubuntu, Debian, Mint, Pop | `openconnect`, `vpnc-scripts`, `python3`, `policykit-1`, `systemd-resolved` |
+
+The bar icon is Omarchy only. On Zorin and the other Debian-family distros the installer stops after the CLI. Connect with `ocgp connect`.
+
+Arch keeps the vpnc script at `/etc/vpnc/vpnc-script` and the HIP report at `/usr/lib/openconnect/hipreport.sh`. Debian-family packages use `/usr/share/vpnc-scripts/vpnc-script`, `/usr/libexec/openconnect/hipreport.sh`, and `/usr/sbin/openconnect`. The client looks for each of those.
 
 ```bash
 git clone https://github.com/deey001/openconnect_gp.git
@@ -26,20 +35,22 @@ The installer asks:
 
 1. GlobalProtect portal address (`vpn.example.com` or `https://vpn.example.com/...`)
 2. Username, which you can leave blank and set in the panel
-3. Bar side: right, left, or center
+3. On Omarchy only, bar side: right, left, or center
 
 It installs:
 
 - `/usr/local/bin/ocgp`
 - `/usr/local/lib/openconnect-gp/vpnc-split`
 - a polkit action, plus a rule that lets the installing user connect and disconnect without a password prompt
-- the bar widget `openconnect-gp`
+- on Omarchy, the bar widget `openconnect-gp`
 
 Non-interactive:
 
 ```bash
 ./install.sh --portal vpn.example.com --username jdoe --section right --yes
 ```
+
+`--section` is required only when Omarchy is installed. `--yes` lets the installer install packages without a second prompt. Uninstall does not remove those packages.
 
 Remove it with `./uninstall.sh`. That asks before deleting, and it leaves `~/.config/openconnect-gp/config.json` in place. The config has no password.
 

@@ -25,7 +25,9 @@ usage() {
   cat <<EOF
 Usage: ./install.sh [--portal HOST] [--username NAME] [--section left|center|right] [--yes]
 
-With no flags, asks for the portal and the bar side.
+Detects the distro and installs its packages.
+Arch and Omarchy use pacman. Zorin, Ubuntu, and Debian use apt.
+With no flags, asks for the portal. The bar side is asked only on Omarchy.
 EOF
 }
 
@@ -57,14 +59,92 @@ while (($# > 0)); do
   esac
 done
 
-command -v openconnect >/dev/null || fail "openconnect is not installed"
-command -v python3 >/dev/null || fail "python3 is not installed"
-[[ -x /usr/lib/openconnect/hipreport.sh ]] || fail "missing /usr/lib/openconnect/hipreport.sh"
-[[ -x /etc/vpnc/vpnc-script ]] || fail "missing /etc/vpnc/vpnc-script"
+# shellcheck source=share/distro.sh
+source "$ROOT/share/distro.sh"
 
 interactive() {
   [[ -t 0 && -t 1 && $ASSUME_YES -eq 0 ]]
 }
+
+first_exec() {
+  local path
+  for path in "$@"; do
+    if [[ -x $path ]]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+os_id="unknown"
+os_like=""
+if [[ -r /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  os_id="${ID:-unknown}"
+  os_like="${ID_LIKE:-}"
+fi
+family="$(distro_family "$os_id" "$os_like")"
+echo "Distro: ${os_id} (${family})"
+
+packages_for() {
+  case "$1" in
+    arch) printf '%s\n' openconnect vpnc python polkit ;;
+    debian) printf '%s\n' openconnect vpnc-scripts python3 policykit-1 systemd-resolved ;;
+    *) return 1 ;;
+  esac
+}
+
+package_installed() {
+  case "$family" in
+    arch) pacman -Q "$1" >/dev/null 2>&1 ;;
+    debian) dpkg-query -W -f '${Status}' "$1" 2>/dev/null | grep -q 'install ok installed' ;;
+    *) return 1 ;;
+  esac
+}
+
+missing=()
+if [[ $family == unknown ]]; then
+  fail "distro '${os_id}' is not supported. Supported: Arch, Omarchy, Zorin, Ubuntu, Debian."
+fi
+while IFS= read -r pkg; do
+  package_installed "$pkg" || missing+=("$pkg")
+done < <(packages_for "$family")
+
+if ((${#missing[@]} > 0)); then
+  echo "Installing packages: ${missing[*]}"
+  if [[ $ASSUME_YES -eq 0 ]]; then
+    interactive || fail "pass --yes to install packages"
+    read -r -p "Install these packages? [y/N] " answer
+    [[ $answer == [yY] ]] || fail "package install declined"
+  fi
+  command -v sudo >/dev/null || fail "sudo is not installed"
+  case "$family" in
+    arch)
+      if ! pacman -Si "${missing[@]}" >/dev/null 2>&1; then
+        sudo pacman -Sy
+      fi
+      sudo pacman -S --needed --noconfirm "${missing[@]}"
+      ;;
+    debian)
+      sudo apt-get update
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+      ;;
+  esac
+  hash -r
+fi
+
+oc_bin="$(command -v openconnect || true)"
+if [[ -z $oc_bin ]]; then
+  oc_bin="$(first_exec /usr/sbin/openconnect /usr/bin/openconnect || true)"
+fi
+[[ -n $oc_bin ]] || fail "openconnect is not installed"
+command -v python3 >/dev/null || fail "python3 is not installed"
+first_exec /usr/lib/openconnect/hipreport.sh /usr/libexec/openconnect/hipreport.sh >/dev/null \
+  || fail "missing hipreport.sh"
+first_exec /etc/vpnc/vpnc-script /usr/share/vpnc-scripts/vpnc-script >/dev/null \
+  || fail "missing vpnc-script"
 
 if [[ -z $PORTAL ]]; then
   interactive || fail "pass --portal"
@@ -85,19 +165,6 @@ if [[ -z $USERNAME && $ASSUME_YES -eq 0 ]]; then
     fi
   fi
 fi
-
-if [[ -z $SECTION ]]; then
-  interactive || fail "pass --section left, center, or right"
-  if command -v gum >/dev/null; then
-    SECTION="$(printf '%s\n' right left center | gum choose --header "Put the VPN icon on which side of the bar?" --selected right)"
-  else
-    echo "Put the VPN icon on which side of the bar?"
-    select SECTION in right left center; do
-      [[ -n $SECTION ]] && break
-    done
-  fi
-fi
-[[ $SECTION == left || $SECTION == center || $SECTION == right ]] || fail "section must be left, center, or right"
 
 user_name="$(id -un)"
 [[ $user_name =~ ^[A-Za-z0-9._-]+$ ]] || fail "user name cannot be embedded in the polkit rule"
@@ -126,8 +193,17 @@ sudo chmod 755 "$BIN_PATH" "$LIB_DIR/vpnc-split"
 sudo install -Dm644 "$ROOT/share/polkit/org.openconnectgp.policy" /usr/share/polkit-1/actions/org.openconnectgp.policy
 rule="$(sed "s/__USER__/${user_name}/g" "$ROOT/share/polkit/10-openconnect-gp.rules.in")"
 rule_path="/etc/polkit-1/rules.d/10-openconnect-gp.rules"
+sudo install -d -m 755 /etc/polkit-1/rules.d
+polkit_group="polkitd"
+if ! getent group polkitd >/dev/null; then
+  if getent group polkit >/dev/null; then
+    polkit_group="polkit"
+  else
+    fail "polkit group not found"
+  fi
+fi
 printf '%s\n' "$rule" | sudo tee "$rule_path" >/dev/null
-sudo chown root:polkitd "$rule_path"
+sudo chown "root:${polkit_group}" "$rule_path"
 sudo chmod 644 "$rule_path"
 if command -v systemctl >/dev/null; then
   sudo systemctl reload polkit || true
@@ -159,9 +235,22 @@ print(path)
 PY
 
 if ! command -v omarchy >/dev/null; then
-  echo "CLI installed. Omarchy is not on PATH, so the bar icon was not added."
+  echo "CLI installed. No Omarchy bar on this distro. Connect with: ocgp connect"
   exit 0
 fi
+
+if [[ -z $SECTION ]]; then
+  interactive || fail "pass --section left, center, or right"
+  if command -v gum >/dev/null; then
+    SECTION="$(printf '%s\n' right left center | gum choose --header "Put the VPN icon on which side of the bar?" --selected right)"
+  else
+    echo "Put the VPN icon on which side of the bar?"
+    select SECTION in right left center; do
+      [[ -n $SECTION ]] && break
+    done
+  fi
+fi
+[[ $SECTION == left || $SECTION == center || $SECTION == right ]] || fail "section must be left, center, or right"
 
 rm -rf "$PLUGIN_DIR"
 mkdir -p "$PLUGIN_DIR"

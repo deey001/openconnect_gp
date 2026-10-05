@@ -8,4 +8,15 @@ if [ "${OCGP_HIP_PROFILE:-}" = "apple-silicon" ]; then
   PATH="$here/apple-silicon:${PATH:-/usr/bin}"
   export PATH
 fi
-exec /usr/lib/openconnect/hipreport.sh "$@"
+hip=""
+for candidate in /usr/lib/openconnect/hipreport.sh /usr/libexec/openconnect/hipreport.sh; do
+  if [ -x "$candidate" ]; then
+    hip=$candidate
+    break
+  fi
+done
+if [ -z "$hip" ]; then
+  echo "missing hipreport.sh" >&2
+  exit 1
+fi
+exec "$hip" "$@"

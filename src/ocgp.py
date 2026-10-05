@@ -13,6 +13,7 @@ import json
 import os
 import pwd
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -31,10 +32,48 @@ LOCK_FILE = RUN_DIR / "lock"
 COOKIE_FILE = RUN_DIR / "cookie"
 TUNNEL_ENV = RUN_DIR / "tunnel.env"
 SERVICE = "ocgp.service"
-REAL_VPNC = Path("/etc/vpnc/vpnc-script")
-HIP_SCRIPT = Path("/usr/lib/openconnect/hipreport.sh")
+# Arch ships the script in /etc. Debian, Ubuntu, and Zorin ship vpnc-scripts
+# under /usr/share and hipreport.sh under /usr/libexec. OpenConnect itself is
+# /usr/sbin/openconnect on those distros.
+VPNC_CANDIDATES = (
+    Path("/etc/vpnc/vpnc-script"),
+    Path("/usr/share/vpnc-scripts/vpnc-script"),
+)
+HIP_CANDIDATES = (
+    Path("/usr/lib/openconnect/hipreport.sh"),
+    Path("/usr/libexec/openconnect/hipreport.sh"),
+)
+OPENCONNECT_CANDIDATES = (
+    Path("/usr/bin/openconnect"),
+    Path("/usr/sbin/openconnect"),
+)
 LIB_DIR = Path("/usr/local/lib/openconnect-gp")
 HELPER = Path("/usr/local/bin/ocgp")
+
+
+def first_executable(paths: tuple[Path, ...]) -> Path | None:
+    for path in paths:
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def find_vpnc_script() -> Path | None:
+    return first_executable(VPNC_CANDIDATES)
+
+
+def find_hip_script() -> Path | None:
+    return first_executable(HIP_CANDIDATES)
+
+
+def openconnect_bin() -> str:
+    found = shutil.which("openconnect")
+    if found:
+        return found
+    path = first_executable(OPENCONNECT_CANDIDATES)
+    if path is None:
+        raise SystemExit("openconnect is not installed")
+    return str(path)
 OS_CHOICES = {"linux", "linux-64", "win", "mac-intel", "apple-silicon", "android", "apple-ios"}
 # OpenConnect 9.21 accepts only mac-intel for a Mac. That value selects the
 # Mac HIP report. apple-silicon keeps the same report and replaces the
@@ -329,10 +368,11 @@ def vpnc_main() -> int:
     env = os.environ.copy()
     if reason in {"connect", "disconnect", "reconnect"}:
         env = rewrite_split_env(env, config or None)
-    if not REAL_VPNC.is_file():
-        print(f"missing {REAL_VPNC}", file=sys.stderr)
+    script = find_vpnc_script()
+    if script is None:
+        print("missing vpnc-script", file=sys.stderr)
         return 1
-    result = subprocess.run([str(REAL_VPNC)], env=env, check=False)
+    result = subprocess.run([str(script)], env=env, check=False)
     if reason == "connect":
         apply_split_dns(env, config or None)
     return result.returncode
@@ -566,7 +606,7 @@ def read_secret() -> tuple[str, str]:
 
 def run_auth(portal: str, username: str, password: str, code: str, os_name: str, browser: bool) -> dict[str, str]:
     cmd = [
-        "openconnect",
+        openconnect_bin(),
         "--protocol=gp",
         "--authenticate",
         f"--os={openconnect_os(os_name)}",
@@ -808,7 +848,7 @@ def cmd_exec_tunnel() -> int:
         print(f"pid file: {exc}", file=sys.stderr)
         return 1
     cmd = [
-        "openconnect",
+        openconnect_bin(),
         "--protocol=gp",
         "--cookie-on-stdin",
         f"--pid-file={PID_FILE}",
@@ -868,8 +908,8 @@ def cmd_tunnel() -> int:
         raise SystemExit("fingerprint refused")
     if not username:
         raise SystemExit("username missing")
-    if not HIP_SCRIPT.is_file():
-        raise SystemExit(f"missing {HIP_SCRIPT}")
+    if find_hip_script() is None:
+        raise SystemExit("missing hipreport.sh")
 
     with lock_run():
         existing = connected_pid()
