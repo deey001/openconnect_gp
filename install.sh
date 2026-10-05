@@ -205,8 +205,11 @@ fi
 printf '%s\n' "$rule" | sudo tee "$rule_path" >/dev/null
 sudo chown "root:${polkit_group}" "$rule_path"
 sudo chmod 644 "$rule_path"
-if command -v systemctl >/dev/null; then
-  sudo systemctl reload polkit || true
+# Zorin/Ubuntu polkit.service has no reload job. systemctl reload prints
+# "Job type reload is not applicable" and changes nothing. polkitd watches
+# rules.d itself. Arch/Omarchy CanReload=yes, so reload there.
+if command -v systemctl >/dev/null && [[ $(systemctl show polkit.service -p CanReload --value 2>/dev/null || true) == yes ]]; then
+  sudo systemctl reload polkit
 fi
 
 python3 - "$ROOT/src" "$PORTAL" "$USERNAME" "$CONFIG_DIR" <<'PY'
